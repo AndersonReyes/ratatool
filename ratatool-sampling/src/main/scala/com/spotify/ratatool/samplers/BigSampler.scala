@@ -19,20 +19,18 @@ package com.spotify.ratatool.samplers
 import java.net.URI
 import java.nio.charset.Charset
 import com.google.api.services.bigquery.model.{TableFieldSchema, TableReference}
-import com.google.common.hash.{HashCode, Hasher, Hashing}
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.hash.{HashCode, Hasher}
 import com.spotify.ratatool.samplers.util.SamplerSCollectionFunctions._
 import com.spotify.ratatool.Command
-import com.spotify.ratatool.avro.specific.TestRecord
 import com.spotify.ratatool.io.FileStorage
 import com.spotify.ratatool.samplers.util._
 import com.spotify.scio.bigquery.TableRow
 import com.spotify.scio.io.ClosedTap
 import com.spotify.scio.values.SCollection
-import com.spotify.scio.{ContextAndArgs, ScioContext}
+import com.spotify.scio.ContextAndArgs
 import com.spotify.scio.coders.Coder
 import org.apache.avro.Schema
 import org.apache.avro.generic.GenericRecord
-import org.apache.beam.runners.dataflow.options.DataflowPipelineWorkerPoolOptions
 import org.apache.beam.sdk.io.FileSystems
 import org.apache.beam.sdk.io.fs.MatchResult.Metadata
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryHelpers
@@ -98,21 +96,22 @@ object BigSampler extends Command {
     Try(new URI(uri)).toOption
 
   private def usage(): Unit = {
-    // scalastyle:off regex line.size.limit
     // TODO: Rename --exact to something better
     println(s"""BigSampler - a tool for big data sampling
         |Usage: ratatool $command [dataflow_options] [options]
         |
-        |  --sample=<percentage>                      Percentage of records to take in sample, a decimal between 0.0 and 1.0
-        |  --input=<path>                             Input file path or BigQuery table
-        |  --output=<path>                            Output file path or BigQuery table
-        |  [--fields=<field1,field2,...>]             An optional list of fields to include in hashing for sampling cohort selection
-        |  [--seed=<seed>]                            An optional seed used in hashing for sampling cohort selection
-        |  [--hashAlgorithm=(murmur|farm)]            An optional arg to select the hashing algorithm for sampling cohort selection. Defaults to FarmHash for BigQuery compatibility
-        |  [--distribution=(uniform|stratified)]      An optional arg to sample for a stratified or uniform distribution. Must provide `distributionFields`
-        |  [--distributionFields=<field1,field2,...>] An optional list of fields to sample for distribution. Must provide `distribution`
-        |  [--exact]                                  An optional arg for higher precision distribution sampling.
-        |  [--byteEncoding=(raw|hex|base64)]          An optional arg for how to encode fields of type bytes: raw bytes, hex encoded string, or base64 encoded string. Default is to hash raw bytes.
+        |  --sample=<percentage>                               Percentage of records to take in sample, a decimal between 0.0 and 1.0
+        |  --input=<path>                                      Input file path or BigQuery table
+        |  --output=<path>                                     Output file path or BigQuery table
+        |  [--fields=<field1,field2,...>]                      An optional list of fields to include in hashing for sampling cohort selection
+        |  [--seed=<seed>]                                     An optional seed used in hashing for sampling cohort selection
+        |  [--hashAlgorithm=(murmur|farm)]                     An optional arg to select the hashing algorithm for sampling cohort selection. Defaults to FarmHash for BigQuery compatibility
+        |  [--distribution=(uniform|stratified)]               An optional arg to sample for a stratified or uniform distribution. Must provide `distributionFields`
+        |  [--distributionFields=<field1,field2,...>]          An optional list of fields to sample for distribution. Must provide `distribution`
+        |  [--exact]                                           An optional arg for higher precision distribution sampling.
+        |  [--byteEncoding=(raw|hex|base64)]                   An optional arg for how to encode fields of type bytes: raw bytes, hex encoded string, or base64 encoded string. Default is to hash raw bytes.
+        |  [--bigqueryPartitioning=<day|hour|month|year|null>] An optional arg specifying what partitioning to use for the output BigQuery table, or 'null' for no partitioning. Defaults to day.
+        |
         |
         |Since this runs a Scio/Beam pipeline, Dataflow options will have to be provided. At a
         |minimum, the following should be specified:
@@ -129,7 +128,6 @@ object BigSampler extends Command {
         |
         |For more details regarding Dataflow options see here: https://cloud.google.com/dataflow/pipelines/specifying-exec-params
       """.stripMargin)
-    // scalastyle:on regex line.size.limit
     sys.exit(1)
   }
 
@@ -140,14 +138,6 @@ object BigSampler extends Command {
     hasher: Hasher
   ): Hasher =
     BigSamplerBigQuery.hashTableRow(tblSchemaFields)(r, f, hasher)
-
-  private[samplers] def hashAvroField(
-    r: TestRecord,
-    f: String,
-    avroSchema: Schema,
-    hasher: Hasher
-  ): Hasher =
-    BigSamplerAvro.hashAvroField(avroSchema)(r, f, hasher)
 
   private[samplers] def hashAvroField(
     r: GenericRecord,
@@ -162,21 +152,33 @@ object BigSampler extends Command {
     FileStorage(path).listFiles
   }
 
-  // scalastyle:off method.length cyclomatic.complexity
+  private def dataflowWorkerMemory(options: PipelineOptions): Option[Int] = Try {
+    val dataflowPipelineWorkerPoolOptions = Class
+      .forName("org.apache.beam.runners.dataflow.options.DataflowPipelineWorkerPoolOptions")
+      .asInstanceOf[Class[PipelineOptions]]
+    val machineType = dataflowPipelineWorkerPoolOptions
+      .getMethod("getWorkerMachineType")
+      .invoke(options.as(dataflowPipelineWorkerPoolOptions))
+      .asInstanceOf[String]
+    val machineTypeParts = machineType.split("-")
+    // approximation. does not work for all machine types families
+    val cpuMemFactor = machineTypeParts(1) match {
+      case "standard" => 4
+      case "highmem"  => 8
+      case "megamem"  => 14
+      case "hypermem" => 20
+      case "ultramem" => 28
+      case "highcpu"  => 2
+      case _          => 1
+    }
+    val machineCpus = machineTypeParts(2).toInt
+    machineCpus * cpuMemFactor
+  }.toOption
+
   def singleInput(argv: Array[String]): ClosedTap[_] = {
     val (sc, args) = ContextAndArgs(argv)
-    val (opts, _) = ScioContext.parseArguments[PipelineOptions](argv)
     // Determines how large our heap should be for topByKey
-    val sizePerKey =
-      if (
-        Try(opts.asInstanceOf[DataflowPipelineWorkerPoolOptions].getWorkerMachineType)
-          .map(_.split("-").last.toInt)
-          .getOrElse(4) > 8
-      ) {
-        1e9.toInt
-      } else {
-        1e6.toInt
-      }
+    val sizePerKey = if (dataflowWorkerMemory(sc.options).exists(_ >= 32)) 1e9.toInt else 1e6.toInt
 
     val (
       samplePct,
@@ -187,7 +189,8 @@ object BigSampler extends Command {
       hashAlgorithm,
       distribution,
       distributionFields,
-      exact
+      exact,
+      bigqueryPartitioning
     ) =
       try {
         val pct = args("sample").toFloat
@@ -201,7 +204,8 @@ object BigSampler extends Command {
           args.optional("hashAlgorithm").map(HashAlgorithm.fromString).getOrElse(FarmHash),
           args.optional("distribution").map(SampleDistribution.fromString),
           args.list("distributionFields"),
-          Precision.fromBoolean(args.boolean("exact", default = false))
+          Precision.fromBoolean(args.boolean("exact", default = false)),
+          args.getOrElse("bigqueryPartitioning", "day")
         )
       } catch {
         case e: Throwable =>
@@ -235,6 +239,10 @@ object BigSampler extends Command {
         s"Input is a BigQuery table `$input`, output should be a BigQuery table too," +
           s"but instead it's `$output`."
       )
+      require(
+        List("DAY", "HOUR", "MONTH", "YEAR", "NULL").contains(bigqueryPartitioning.toUpperCase),
+        s"bigqueryPartitioning must be either 'day', 'month', 'year', or 'null', found $bigqueryPartitioning"
+      )
       val inputTbl = parseAsBigQueryTable(input).get
       val outputTbl = parseAsBigQueryTable(output).get
 
@@ -250,7 +258,8 @@ object BigSampler extends Command {
         distributionFields,
         exact,
         sizePerKey,
-        byteEncoding
+        byteEncoding,
+        bigqueryPartitioning.toUpperCase
       )
     } else if (parseAsURI(input).isDefined) {
       // right now only support for avro
@@ -259,7 +268,7 @@ object BigSampler extends Command {
         s"Input is a URI: `$input`, output should be a URI too, but instead it's `$output`."
       )
       // Prompts FileSystems to load service classes, otherwise fetching schema from non-local fails
-      FileSystems.setDefaultPipelineOptions(opts)
+      FileSystems.setDefaultPipelineOptions(sc.options)
       val fileNames = getMetadata(input).map(_.resourceId().getFilename)
 
       input match {
@@ -302,9 +311,7 @@ object BigSampler extends Command {
       throw new UnsupportedOperationException(s"Input `$input not supported.")
     }
   }
-  // scalastyle:on method.length cyclomatic.complexity
 
-  // scalastyle:off method.length cyclomatic.complexity parameter.number
   /**
    * Sample wrapper function that manages sampling pipeline based on determinimism, precision, and
    * data type. Can be used to build sampling for data types not supported out of the box.
@@ -426,7 +433,6 @@ object BigSampler extends Command {
         throw new UnsupportedOperationException("This sampling mode is not currently supported")
     }
   }
-  // scalastyle:on method.length cyclomatic.complexity
 
   def run(argv: Array[String]): Unit =
     this.singleInput(argv)

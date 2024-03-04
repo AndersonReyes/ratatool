@@ -20,10 +20,11 @@ package com.spotify.ratatool.samplers
 import java.nio.ByteBuffer
 import java.util.{List => JList}
 
-import com.google.common.hash.Hasher
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.hash.Hasher
 import com.spotify.ratatool.io.{AvroIO, FileStorage}
 import com.spotify.ratatool.samplers.util._
 import com.spotify.scio.ScioContext
+import com.spotify.scio.avro._
 import com.spotify.scio.io.{ClosedTap, MaterializeTap}
 import org.apache.avro.Schema
 import org.apache.avro.Schema.Type
@@ -157,7 +158,6 @@ private[samplers] object BigSamplerAvro {
     }
   }
 
-  // scalastyle:off cyclomatic.complexity
   private def hashPrimitive(
     fieldName: String,
     fieldSchema: Schema,
@@ -183,8 +183,6 @@ private[samplers] object BigSamplerAvro {
         )
     }
   }
-
-  // scalastyle:on cyclomatic.complexity
 
   private def hashEnum(
     fieldName: String,
@@ -221,7 +219,6 @@ private[samplers] object BigSamplerAvro {
     }
   }
 
-  // scalastyle:off method.length cyclomatic.complexity parameter.number
   private[samplers] def sample(
     sc: ScioContext,
     input: String,
@@ -238,14 +235,13 @@ private[samplers] object BigSamplerAvro {
   ): ClosedTap[GenericRecord] = {
     val schema = AvroIO.getAvroSchemaFromFile(input)
     val outputParts = if (output.endsWith("/")) output + "part*" else output + "/part*"
+    implicit val coder: Coder[GenericRecord] = avroGenericRecordCoder(schema)
+
     if (FileStorage(outputParts).isDone) {
-      implicit val coder: Coder[GenericRecord] = Coder.avroGenericRecordCoder(schema)
       log.info(s"Reuse previous sample at $outputParts")
       ClosedTap(MaterializeTap[GenericRecord](outputParts, sc))
     } else {
       log.info(s"Will sample from: $input, output will be $output")
-      implicit val grCoder: Coder[GenericRecord] = Coder.avroGenericRecordCoder(schema)
-
       val coll = sc.avroFile(input, schema)
 
       val sampledCollection = sampleAvro(
@@ -267,5 +263,4 @@ private[samplers] object BigSamplerAvro {
       r
     }
   }
-  // scalastyle:on method.length cyclomatic.complexity parameter.number
 }

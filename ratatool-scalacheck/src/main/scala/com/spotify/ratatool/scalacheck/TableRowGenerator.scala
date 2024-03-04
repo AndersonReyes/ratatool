@@ -19,9 +19,9 @@ package com.spotify.ratatool.scalacheck
 
 import java.nio.ByteBuffer
 import java.util
-
 import com.google.api.services.bigquery.model.{TableFieldSchema, TableRow, TableSchema}
 import com.google.common.io.BaseEncoding
+import com.spotify.ratatool.BigQueryUtil.getFieldModeWithDefault
 import org.joda.time._
 import org.joda.time.format.DateTimeFormat
 import org.scalacheck.{Arbitrary, Gen}
@@ -121,7 +121,6 @@ trait TableRowGeneratorOps {
     }
   }
 
-  // scalastyle:off cyclomatic.complexity
   private def tableFieldValueOf(fieldSchema: TableFieldSchema): Gen[TableFieldValue] = {
     val n = fieldSchema.getName
     def genV(): Gen[TableFieldValue] = fieldSchema.getType match {
@@ -145,7 +144,7 @@ trait TableRowGeneratorOps {
       case t => throw new RuntimeException(s"Unknown type: $t")
     }
 
-    fieldSchema.getMode match {
+    getFieldModeWithDefault(fieldSchema.getMode) match {
       case "REQUIRED" => genV()
       case "NULLABLE" =>
         Arbitrary.arbBool.arbitrary.flatMap { e =>
@@ -156,5 +155,4 @@ trait TableRowGeneratorOps {
       case m => throw new RuntimeException(s"Unknown mode: $m")
     }
   }
-  // scalastyle:on cyclomatic.complexity
 }

@@ -19,7 +19,7 @@ package com.spotify.ratatool.samplers
 
 import java.util.{List => JList}
 import com.google.api.services.bigquery.model.{TableFieldSchema, TableReference}
-import com.google.common.hash.Hasher
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.hash.Hasher
 import com.spotify.ratatool.samplers.util._
 import com.spotify.scio.ScioContext
 import com.spotify.scio.bigquery.TableRow
@@ -39,7 +39,6 @@ private[samplers] object BigSamplerBigQuery {
 
   private val log = LoggerFactory.getLogger(BigSamplerBigQuery.getClass)
 
-  // scalastyle:off cyclomatic.complexity method.length
   private[samplers] def hashTableRow(
     tblSchema: => Seq[TableFieldSchema]
   )(r: TableRow, fieldStr: String, hasher: Hasher): Hasher = {
@@ -92,9 +91,7 @@ private[samplers] object BigSamplerBigQuery {
       }
     }
   }
-  // scalastyle:on cyclomatic.complexity method.length
 
-  // scalastyle:off cyclomatic.complexity
   // TODO: Potentially reduce this and hashAvroField to a single function
   @tailrec
   private[samplers] def getTableRowField(
@@ -125,7 +122,6 @@ private[samplers] object BigSamplerBigQuery {
       }
     }
   }
-  // scalastyle:on cyclomatic.complexity
 
   /**
    * Builds a key function per record Sets do not have deterministic ordering so we return a sorted
@@ -144,7 +140,6 @@ private[samplers] object BigSamplerBigQuery {
       .sorted
   }
 
-  // scalastyle:off method.length cyclomatic.complexity parameter.number
   // TODO: investigate if possible to move this logic to BQ itself
   private[samplers] def sample(
     sc: ScioContext,
@@ -158,7 +153,8 @@ private[samplers] object BigSamplerBigQuery {
     distributionFields: List[String],
     precision: Precision,
     sizePerKey: Int,
-    byteEncoding: ByteEncoding = RawEncoding
+    byteEncoding: ByteEncoding = RawEncoding,
+    bigqueryPartitioning: String
   ): ClosedTap[TableRow] = {
     import BigQueryIO.Write.CreateDisposition.CREATE_IF_NEEDED
     import BigQueryIO.Write.WriteDisposition.WRITE_EMPTY
@@ -188,6 +184,10 @@ private[samplers] object BigSamplerBigQuery {
         byteEncoding
       )
 
+      val partitioning = bigqueryPartitioning match {
+        case "NULL" => null
+        case _      => TimePartitioning(bigqueryPartitioning)
+      }
       val r = sampledCollection
         .saveAsBigQueryTable(
           Table.Ref(outputTbl),
@@ -195,11 +195,10 @@ private[samplers] object BigSamplerBigQuery {
           WRITE_EMPTY,
           CREATE_IF_NEEDED,
           tableDescription = "",
-          TimePartitioning("DAY")
+          partitioning
         )
       sc.run().waitUntilDone()
       r
     }
   }
-  // scalastyle:on method.length cyclomatic.complexity parameter.number
 }

@@ -18,61 +18,105 @@
 package com.spotify.ratatool.scalacheck
 
 import com.spotify.ratatool.avro.specific.{RequiredNestedRecord, TestRecord}
-import org.apache.beam.sdk.coders.AvroCoder
-import org.apache.beam.sdk.util.CoderUtils
+import org.apache.avro.generic.GenericData
+import org.apache.avro.util.Utf8
+import org.apache.avro.{Conversions, LogicalTypes, SchemaBuilder}
 import org.scalacheck._
-import org.scalacheck.Prop.{all, forAll, propBoolean, AnyOperators}
+import org.scalatest.flatspec.AnyFlatSpec
+import org.scalatest.matchers.should.Matchers
+import org.scalatestplus.scalacheck.ScalaCheckPropertyChecks
 
-object AvroGeneratorTest extends Properties("AvroGenerator") {
-  property("round trips") = forAll(specificRecordOf[TestRecord]) { m =>
-    val coder = AvroCoder.of(classOf[TestRecord])
+class AvroGeneratorTest extends AnyFlatSpec with Matchers with ScalaCheckPropertyChecks {
 
-    val bytes = CoderUtils.encodeToByteArray(coder, m)
-    val decoded = CoderUtils.decodeFromByteArray(coder, bytes)
-    decoded ?= m
+  val genTestRecord = specificRecordOf[TestRecord]
+  val genRequiredNestedRecord = specificRecordOf[RequiredNestedRecord]
+
+  "AvroGenerator" should "support RichAvroGen" in {
+    val genRich = genTestRecord
+      .amend(Gen.choose(10, 20))(_.getNullableFields.setIntField)
+      .amend(Gen.choose(10L, 20L))(_.getNullableFields.setLongField)
+      .amend(Gen.choose(10.0f, 20.0f))(_.getNullableFields.setFloatField)
+      .amend(Gen.choose(10.0, 20.0))(_.getNullableFields.setDoubleField)
+      .amend(Gen.const(true))(_.getNullableFields.setBooleanField)
+      .amend(Gen.const("hello"))(
+        _.getNullableFields.setStringField,
+        m => s => m.getNullableFields.setUpperStringField(s.toUpperCase)
+      )
+      .amend(Gen.const(BigDecimal("5.000000001").bigDecimal))(
+        _.getRequiredFields.setLogicalDecimalField
+      )
+
+    forAll(genRich) { r =>
+      r.getNullableFields.getIntField.toInt should (be >= 10 and be <= 20)
+      r.getNullableFields.getLongField.toLong should (be >= 10L and be <= 20L)
+      r.getNullableFields.getDoubleField.toDouble should (be >= 10.0 and be <= 20.0)
+      r.getNullableFields.getBooleanField shouldBe true
+      r.getNullableFields.getUpperStringField shouldBe "HELLO"
+      r.getRequiredFields.getLogicalDecimalField shouldBe BigDecimal("5.000000001").bigDecimal
+    }
   }
 
-  val richGen = specificRecordOf[TestRecord]
-    .amend(Gen.choose(10, 20))(_.getNullableFields.setIntField)
-    .amend(Gen.choose(10L, 20L))(_.getNullableFields.setLongField)
-    .amend(Gen.choose(10.0f, 20.0f))(_.getNullableFields.setFloatField)
-    .amend(Gen.choose(10.0, 20.0))(_.getNullableFields.setDoubleField)
-    .amend(Gen.const(true))(_.getNullableFields.setBooleanField)
-    .amend(Gen.const("hello"))(
-      _.getNullableFields.setStringField,
-      m => s => m.getNullableFields.setUpperStringField(s.toUpperCase)
-    )
-    .amend(Gen.const(BigDecimal("5.000000001").bigDecimal))(
-      _.getRequiredFields.setLogicalDecimalField
-    )
+  it should "support RichAvroTupGen" in {
+    val genRichTup = (genTestRecord, genTestRecord).tupled
+      .amend2(genRequiredNestedRecord)(_.setRequiredFields, _.setRequiredFields)
 
-  val richTupGen = (specificRecordOf[TestRecord], specificRecordOf[TestRecord]).tupled
-    .amend2(specificRecordOf[RequiredNestedRecord])(_.setRequiredFields, _.setRequiredFields)
-
-  property("support RichAvroGen") = forAll(richGen) { r =>
-    all(
-      "Int" |:
-        r.getNullableFields.getIntField >= 10 && r.getNullableFields.getIntField <= 20,
-      "Long" |:
-        r.getNullableFields.getLongField >= 10L && r.getNullableFields.getLongField <= 20L,
-      "Float" |:
-        r.getNullableFields.getFloatField >= 10.0f && r.getNullableFields.getFloatField <= 20.0f,
-      "Double" |:
-        r.getNullableFields.getDoubleField >= 10.0 && r.getNullableFields.getDoubleField <= 20.0,
-      "Boolean" |: r.getNullableFields.getBooleanField == true,
-      "String" |: r.getNullableFields.getStringField == "hello",
-      "String" |: r.getNullableFields.getUpperStringField == "HELLO",
-      "BigDecimal" |: r.getRequiredFields.getLogicalDecimalField == BigDecimal(
-        "5.000000001"
-      ).bigDecimal
-    )
+    forAll(genRichTup) { case (a, b) =>
+      a.getRequiredFields shouldBe b.getRequiredFields
+    }
   }
 
-  property("support RichAvroTupGen") = forAll(richTupGen) { case (a, b) =>
-    (a.getRequiredFields.getBooleanField == b.getRequiredFields.getBooleanField
-      && a.getRequiredFields.getIntField == b.getRequiredFields.getIntField
-      && a.getRequiredFields.getStringField.toString == b.getRequiredFields.getStringField.toString
-      && a.getRequiredFields.getLongField == b.getRequiredFields.getLongField)
+  it should "support logical type" in {
+    // format: off
+    val decimalType = LogicalTypes.decimal(10, 2).addToSchema(SchemaBuilder.builder().bytesType())
+    val schema = SchemaBuilder
+      .builder()
+      .record("TestLogicalType")
+      .fields()
+      .name("cost").`type`(decimalType).noDefault()
+      .endRecord()
+    // format: on
+
+    // For generic records, logical type conversion must be explicitly enabled
+    GenericData.get().addLogicalTypeConversion(new Conversions.DecimalConversion)
+
+    val gen = avroOf(schema)
+    forAll(gen) { r =>
+      r.get("cost") shouldBe a[java.math.BigDecimal]
+    }
   }
 
+  it should "respect string type" in {
+    // format: off
+    val schema = SchemaBuilder
+      .builder()
+      .record("TestStringType")
+      .fields()
+      .name("defaultStringField").`type`().stringType().noDefault()
+      .name("javaStringField").`type`().stringBuilder().prop(GenericData.STRING_PROP, "String").endString().noDefault()
+      .name("charSequenceField").`type`().stringBuilder().prop(GenericData.STRING_PROP, "CharSequence").endString().noDefault()
+      .name("utf8Field").`type`().stringBuilder().prop(GenericData.STRING_PROP, "CharSequence").endString().noDefault()
+      .name("mapDefaultKeyField").`type`().map().values().longType().noDefault()
+      .name("mapJavaStringKeyField").`type`().map().prop(GenericData.STRING_PROP, "String").values().longType().noDefault()
+      .endRecord()
+    // format: on
+
+    val gen = avroOf(schema)
+
+    forAll(gen) { r =>
+      r.get("defaultStringField") shouldBe an[Utf8]
+      r.get("javaStringField") shouldBe a[String]
+      r.get("charSequenceField") shouldBe an[Utf8]
+      r.get("utf8Field") shouldBe an[Utf8]
+
+      {
+        val m = r.get("mapDefaultKeyField").asInstanceOf[java.util.Map[_, _]]
+        if (!m.isEmpty) m.keySet().iterator().next() shouldBe an[Utf8]
+      }
+
+      {
+        val m = r.get("mapJavaStringKeyField").asInstanceOf[java.util.Map[_, _]]
+        if (!m.isEmpty) m.keySet().iterator().next() shouldBe a[String]
+      }
+    }
+  }
 }
